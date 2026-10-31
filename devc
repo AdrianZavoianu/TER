@@ -1,0 +1,516 @@
+#!/usr/bin/env bash
+# devc — per-project terminal command center on tmux, for WSL + Windows Terminal.
+# One `devc start` per project opens a dedicated window with all dev processes
+# (backend, frontend, N workers, shells) as live tiled panes. See README.md.
+set -euo pipefail
+
+SOCKET=devc                 # dedicated tmux server, keeps user's tmux untouched
+CONF=.devc
+LOGROOT="$HOME/.devc/logs"
+
+# palette: bright fg on faded dark bg tints (diff-highlight style)
+C_BLUE='#6cb6ff'  BG_BLUE='#223047'   # services
+C_GREEN='#7ee787' BG_GREEN='#22372a'  # workers
+C_RED='#ff7b72'   BG_RED='#3a262a'    # dead panes
+C_GRAY='#9aa0a6'  BG_GRAY='#2b2e35'   # shells, chrome
+C_TEXT='#e6edf3'                      # chip text: bright, readable on any tint
+C_BORDER='#3a3f4b'
+
+t() { tmux -L "$SOCKET" "$@"; }
+die() { echo "devc: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+devc — per-project terminal command center (tmux + Windows Terminal)
+
+  devc init                  scaffold a .devc config in the current directory
+  devc start [-w N] [--here] [-d]
+                             start the project's session and open its window
+                               -w N     override count of the 'worker' pane
+                               --here   attach in this terminal instead of WT
+                               -d       start detached (no window, no attach)
+  devc attach [project]      attach in the current terminal
+  devc stop [project]        stop the project's session
+  devc status                list running projects and their panes
+  devc restart <name>        restart one pane's command in place
+  devc scale <name> N        set the number of instances of a pane, live
+  devc add <name> [-t pane] [-h|-v] [-l size] [command]
+                             add a pane at runtime (default: interactive zsh)
+                               -t pane  split this pane instead of 'ctl'
+                               -h|-v    beside it / below it (default -v)
+                               -l size  new pane's size, e.g. 30% or 20
+                             'name-N' with no command reuses config's 'name'
+  devc logs <name> [-f]      view (-f: follow) a pane's log file
+  devc port <base>           print the first free port >= base
+
+Config: .devc at the project root, one pane per line — `name: command`,
+`name*N: command` for N instances. A `ports: VAR=base ...` line picks the
+first free port >= base per VAR at start and exports it to every pane.
+Logs: ~/.devc/logs/<project>/<pane>.log
+EOF
+}
+
+# ---------- project resolution ----------
+PROJ='' ROOT='' SES=''
+
+resolve() { # [explicit project name] — else $DEVC_ROOT, else walk up from cwd
+  local want="${1:-}"
+  if [[ -n "$want" ]]; then
+    PROJ="$want"; SES="devc-${PROJ//[.:]/_}"
+    t has-session -t "=$SES" 2>/dev/null || die "no running session for '$want'"
+    # NB: tmux 3.2a set/show-options reject '='-prefixed session targets
+    ROOT=$(t show -t "$SES" -qv @devc_root 2>/dev/null || true)
+    return
+  fi
+  if [[ -n "${DEVC_ROOT:-}" && -f "$DEVC_ROOT/$CONF" ]]; then
+    ROOT="$DEVC_ROOT"
+  else
+    local d="$PWD"
+    while [[ "$d" != / ]]; do
+      [[ -f "$d/$CONF" ]] && { ROOT="$d"; break; }
+      d="$(dirname "$d")"
+    done
+  fi
+  [[ -n "$ROOT" ]] || die "no $CONF found here or above — run 'devc init' in the project root"
+  PROJ="$(basename "$ROOT")"
+  SES="devc-${PROJ//[.:]/_}"
+}
+
+require_session() {
+  t has-session -t "=$SES" 2>/dev/null || die "$PROJ is not running — try 'devc start'"
+}
+
+# ---------- config ----------
+CFG_NAMES=() CFG_CMDS=() CFG_COUNTS=() CFG_PORTS=''
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+parse_config() {
+  CFG_NAMES=() CFG_CMDS=() CFG_COUNTS=() CFG_PORTS=''
+  local line name cmd count
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *:* ]] || die "bad line in $ROOT/$CONF (want 'name: command'): $line"
+    name="$(trim "${line%%:*}")"
+    cmd="$(trim "${line#*:}")"
+    if [[ "$name" == ports ]]; then
+      CFG_PORTS+="${CFG_PORTS:+ }$cmd"
+      continue
+    fi
+    count=1
+    if [[ "$name" == *\** ]]; then
+      count="${name##*\*}"
+      name="$(trim "${name%\**}")"
+    fi
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "bad pane name '$name' in $CONF"
+    [[ "$name" == ctl ]] && die "'ctl' is reserved in $CONF"
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "bad count for '$name' in $CONF"
+    [[ -n "$cmd" ]] || die "empty command for '$name' in $CONF"
+    CFG_NAMES+=("$name"); CFG_CMDS+=("$cmd"); CFG_COUNTS+=("$count")
+  done <"$ROOT/$CONF"
+  [[ ${#CFG_NAMES[@]} -gt 0 ]] || die "$ROOT/$CONF defines no panes"
+}
+
+config_cmd_for() { # base name -> command from config, empty if absent
+  parse_config
+  local i
+  for i in "${!CFG_NAMES[@]}"; do
+    [[ "${CFG_NAMES[$i]}" == "$1" ]] && { printf '%s' "${CFG_CMDS[$i]}"; return; }
+  done
+}
+
+# ---------- ports ----------
+PORTS_ENV='' PORT_E_ARGS=()
+
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+pick_port() { # base [space-separated ports to skip] -> first free port
+  local p="$1" skip=" ${2:-} " end=$(($1 + 100))
+  while ((p <= end)); do
+    if [[ "$skip" != *" $p "* ]] && ! port_in_use "$p"; then
+      echo "$p"; return 0
+    fi
+    ((p++))
+  done
+  return 1
+}
+
+resolve_ports() { # CFG_PORTS ('VAR=base ...') -> PORTS_ENV/PORT_E_ARGS with picked ports
+  PORTS_ENV='' PORT_E_ARGS=()
+  [[ -z "$CFG_PORTS" ]] && return 0
+  local tok name base picked used=''
+  for tok in $CFG_PORTS; do
+    [[ "$tok" =~ ^[A-Za-z_][A-Za-z0-9_]*=[0-9]+$ ]] || die "bad ports entry '$tok' (want VAR=basePort)"
+    name="${tok%%=*}"; base="${tok#*=}"
+    picked=$(pick_port "$base" "$used") || die "no free port near $base for $name"
+    used+=" $picked"
+    PORTS_ENV+="${PORTS_ENV:+ }$name=$picked"
+    PORT_E_ARGS+=(-e "$name=$picked")
+  done
+}
+
+load_ports() { # from a running session, for restart/scale/add
+  PORTS_ENV=$(t show -t "$SES" -qv @devc_ports 2>/dev/null || true)
+  PORT_E_ARGS=()
+  local tok
+  for tok in $PORTS_ENV; do PORT_E_ARGS+=(-e "$tok"); done
+}
+
+# ---------- panes ----------
+is_shell() { case "$1" in zsh|bash|sh|fish) return 0 ;; *) return 1 ;; esac; }
+
+wrap_cmd() { # name instance rawcmd -> command string for zsh -ic
+  # env is baked into the string so `devc restart` rebuilds it identically
+  printf 'export DEVC_PROJECT=%q DEVC_ROOT=%q DEVC_PANE=%q DEVC_INSTANCE=%q COLORTERM=truecolor; %s%s' \
+    "$PROJ" "$ROOT" "$1" "$2" "${PORTS_ENV:+export $PORTS_ENV; }" "$3"
+}
+
+mark_pane() { # id name base inst rawcmd kind — tag pane + title + log pipe
+  local id="$1" name="$2"
+  t set -p -t "$id" @devc_name "$name"
+  t set -p -t "$id" @devc_base "$3"
+  t set -p -t "$id" @devc_inst "$4"
+  t set -p -t "$id" @devc_cmd "$5"
+  t set -p -t "$id" @devc_kind "$6"
+  t select-pane -t "$id" -T "$name"
+  mkdir -p "$LOGROOT/$PROJ"
+  printf '\n=== devc %s | %s ===\n' "$name" "$(date '+%F %T')" >>"$LOGROOT/$PROJ/$name.log"
+  t pipe-pane -o -t "$id" "exec cat >> $(printf '%q' "$LOGROOT/$PROJ/$name.log")"
+}
+
+LAST_PANE_ID=''
+
+spawn_pane() { # name base inst rawcmd [target-pane] [-h|-v] [size]
+  # Every pane is a real interactive zsh; service commands are typed into it
+  # (send-keys), so Ctrl-C lands on a prompt and Up+Enter reruns the command.
+  local name="$1" base="$2" inst="$3" cmd="$4"
+  local target="${5:-}" dir="${6:--h}" size="${7:-50%}" id kind=service
+  [[ -n "$target" ]] || target="=$SES:0"
+  local sargs=(-d -P -F '#{pane_id}' "$dir" -l "$size" -t "$target" -c "$ROOT"
+    -e DEVC_PROJECT="$PROJ" -e DEVC_ROOT="$ROOT" -e DEVC_PANE="$name"
+    -e DEVC_INSTANCE="$inst" -e COLORTERM=truecolor)
+  if ((${#PORT_E_ARGS[@]})); then sargs+=("${PORT_E_ARGS[@]}"); fi
+  if is_shell "$cmd"; then
+    kind=shell
+    id=$(t split-window "${sargs[@]}" -- "$cmd")
+  else
+    [[ "$base" == worker* || "$name" != "$base" ]] && kind=worker
+    id=$(t split-window "${sargs[@]}" -- zsh)
+    t set -p -t "$id" remain-on-exit on   # dead only if the shell itself exits
+    t send-keys -t "$id" -l "$cmd"
+    t send-keys -t "$id" Enter
+  fi
+  mark_pane "$id" "$name" "$base" "$inst" "$cmd" "$kind"
+  LAST_PANE_ID="$id"
+}
+
+pane_by_name() { # name -> pane id (empty if none)
+  t list-panes -t "=$SES:0" -F '#{pane_id} #{@devc_name}' |
+    awk -v n="$1" '$2==n{print $1; exit}'
+}
+
+# ---------- session ----------
+build_session() { # [worker count override]
+  local wover="${1:-}"
+  parse_config
+  resolve_ports
+  t new-session -d -s "$SES" -c "$ROOT" -x 250 -y 60 \
+    -e DEVC_PROJECT="$PROJ" -e DEVC_ROOT="$ROOT" -e DEVC_PANE=ctl -e DEVC_INSTANCE='' \
+    "${PORT_E_ARGS[@]}" -- zsh
+  # options live on our private server/session — user tmux defaults untouched
+  # (plain session targets: tmux 3.2a set/show reject '='-prefixed ones)
+  t set -s default-terminal tmux-256color
+  t set -sa terminal-overrides '*:RGB'
+  t set -t "$SES" mouse on
+  t set -t "$SES" history-limit 50000
+  t set -t "$SES" @devc_root "$ROOT"
+  t set -t "$SES" @devc_ports "$PORTS_ENV"
+  t set -w -t "$SES:0" pane-border-status top
+  # title chips: colored dot + bright text on a faded bg tint — blue service,
+  # green worker, gray shell, red when dead (no commas inside #[..]: they
+  # break #{?..,..})
+  local chip="#[fg=$C_TEXT bold]#{@devc_name} "
+  t set -w -t "$SES:0" pane-border-format \
+    " #{?pane_dead,#[fg=$C_RED bg=$BG_RED] ✖ ${chip}exit:#{pane_dead_status} ,#{?#{==:#{@devc_kind},shell},#[fg=$C_GRAY bg=$BG_GRAY] ● $chip,#{?#{==:#{@devc_kind},worker},#[fg=$C_GREEN bg=$BG_GREEN] ● $chip,#[fg=$C_BLUE bg=$BG_BLUE] ● $chip}}}#[default]"
+  t set -w -t "$SES:0" pane-border-style "fg=$C_BORDER"
+  t set -w -t "$SES:0" pane-active-border-style "fg=$C_BLUE"
+  t set -t "$SES" status-style "bg=$BG_GRAY,fg=$C_GRAY"
+  t set -t "$SES" status-left "#[fg=$C_BLUE bold] $PROJ #[default]"
+  t set -t "$SES" status-left-length 30
+  t set -t "$SES" status-right "#[fg=$C_GRAY]%H:%M "
+  t set -t "$SES" window-status-format ''
+  t set -t "$SES" window-status-current-format ''
+  t set -t "$SES" mode-style "bg=$BG_BLUE"
+  local ctl_id
+  ctl_id=$(t list-panes -t "=$SES:0" -F '#{pane_id}')
+  mark_pane "$ctl_id" ctl ctl '' zsh shell
+
+  # fixed layout: ctl top-left | frontend top-right of the left region;
+  # backend = full-height right column; everything else evenly across the
+  # bottom row of the left region
+  # ponytail: one bottom row; split it into two rows if >4 rest panes someday
+  local i name cmd count n
+  local backend_cmd='' frontend_cmd=''
+  local rest_names=() rest_bases=() rest_insts=() rest_cmds=()
+  for i in "${!CFG_NAMES[@]}"; do
+    name="${CFG_NAMES[$i]}"; cmd="${CFG_CMDS[$i]}"; count="${CFG_COUNTS[$i]}"
+    [[ "$name" == worker && -n "$wover" ]] && count="$wover"
+    if [[ "$name" == backend && "$count" -eq 1 ]]; then backend_cmd="$cmd"; continue; fi
+    if [[ "$name" == frontend && "$count" -eq 1 ]]; then frontend_cmd="$cmd"; continue; fi
+    if [[ "$count" -eq 1 ]]; then
+      rest_names+=("$name"); rest_bases+=("$name"); rest_insts+=(1); rest_cmds+=("$cmd")
+    else
+      for ((n = 1; n <= count; n++)); do
+        rest_names+=("$name-$n"); rest_bases+=("$name"); rest_insts+=("$n"); rest_cmds+=("$cmd")
+      done
+    fi
+  done
+
+  [[ -n "$backend_cmd" ]] && spawn_pane backend backend 1 "$backend_cmd" "$ctl_id" -h '33%'
+  local m=${#rest_names[@]} prev='' j pct
+  if ((m > 0)); then # seed the bottom row before frontend splits the top row
+    spawn_pane "${rest_names[0]}" "${rest_bases[0]}" "${rest_insts[0]}" "${rest_cmds[0]}" "$ctl_id" -v '50%'
+    prev="$LAST_PANE_ID"
+  fi
+  [[ -n "$frontend_cmd" ]] && spawn_pane frontend frontend 1 "$frontend_cmd" "$ctl_id" -h '50%'
+  for ((j = 1; j < m; j++)); do
+    pct=$(((m - j) * 100 / (m - j + 1)))
+    spawn_pane "${rest_names[$j]}" "${rest_bases[$j]}" "${rest_insts[$j]}" "${rest_cmds[$j]}" "$prev" -h "$pct%"
+    prev="$LAST_PANE_ID"
+  done
+  t select-pane -t "$ctl_id"
+}
+
+# ---------- Windows Terminal ----------
+find_wt() {
+  command -v wt.exe 2>/dev/null && return 0
+  local c
+  for c in /mnt/c/Users/*/AppData/Local/Microsoft/WindowsApps/wt.exe; do
+    [[ -e "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+open_window() {
+  if [[ -n "$(t list-clients -t "=$SES" 2>/dev/null)" ]]; then
+    echo "devc: $PROJ is already open in a terminal ('devc attach' for another view)"
+    return 0
+  fi
+  local wt
+  if ! wt=$(find_wt); then
+    echo "devc: wt.exe not found — attaching here instead" >&2
+    exec tmux -L "$SOCKET" attach -t "=$SES"
+  fi
+  local args=(-w "$SES" new-tab --title "$PROJ" --suppressApplicationTitle -- wsl.exe)
+  [[ -n "${WSL_DISTRO_NAME:-}" ]] && args+=(-d "$WSL_DISTRO_NAME")
+  args+=(--cd "$ROOT" -- zsh -ic "devc attach $PROJ")
+  "$wt" "${args[@]}"
+  echo "devc: opened Windows Terminal window for $PROJ"
+}
+
+# ---------- commands ----------
+cmd_init() {
+  [[ -e "$PWD/$CONF" ]] && die "$PWD/$CONF already exists"
+  cat >"$PWD/$CONF" <<'EOF'
+# devc config — one pane per line:  name: command
+# Commands run from the project root via zsh (interactive, so nvm/pipenv work).
+# Scale with a count suffix:  name*N: command  → panes name-1..name-N, each
+# with $DEVC_INSTANCE set. A command that is just a shell (zsh) gives an
+# interactive pane. The auto-added 'ctl' master pane doubles as the general
+# shell (git etc.) — add more anytime with:  devc add <name>
+# Apply config changes with:  devc stop && devc start
+#
+# Auto ports: a 'ports:' line picks the first free port >= base per VAR at
+# start and exports the SAME values to every pane (services and shells).
+
+# ports: BACKEND_PORT=8000 FRONTEND_PORT=5173
+# backend: cd backend && pipenv run uvicorn app.main:app --reload --port $BACKEND_PORT
+# frontend: cd frontend && npm run dev -- --port $FRONTEND_PORT
+# worker*2: pipenv run python worker.py
+# shell: zsh
+EOF
+  echo "devc: wrote $PWD/$CONF — edit it, then run 'devc start'"
+}
+
+cmd_start() {
+  local wover='' here=0 detach=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w) wover="${2:-}"; shift 2 || die "-w needs a number" ;;
+      --here) here=1; shift ;;
+      -d|--detach) detach=1; shift ;;
+      *) die "unknown start option '$1'" ;;
+    esac
+  done
+  [[ -z "$wover" || "$wover" =~ ^[0-9]+$ ]] || die "-w needs a number"
+  resolve
+  if t has-session -t "=$SES" 2>/dev/null; then
+    echo "devc: $PROJ is already running"
+  else
+    build_session "$wover"
+    echo "devc: started $PROJ ($(t list-panes -t "=$SES:0" | wc -l) panes)"
+    [[ -n "$PORTS_ENV" ]] && echo "devc: ports $PORTS_ENV"
+  fi
+  [[ "$detach" -eq 1 ]] && return 0
+  if [[ "$here" -eq 1 ]]; then
+    exec tmux -L "$SOCKET" attach -t "=$SES"
+  fi
+  open_window
+}
+
+cmd_attach() {
+  resolve "${1:-}"
+  require_session
+  exec tmux -L "$SOCKET" attach -t "=$SES"
+}
+
+cmd_stop() {
+  resolve "${1:-}"
+  require_session
+  t kill-session -t "=$SES"
+  echo "devc: stopped $PROJ"
+}
+
+cmd_status() {
+  local sessions
+  sessions=$(t ls -F '#{session_name}' 2>/dev/null) || { echo "devc: nothing running"; return 0; }
+  local s root clients
+  for s in $sessions; do
+    root=$(t show -t "$s" -qv @devc_root 2>/dev/null || true)
+    clients=$(t list-clients -t "=$s" 2>/dev/null | wc -l)
+    echo "$s  root:$root  clients:$clients"
+    ports=$(t show -t "$s" -qv @devc_ports 2>/dev/null || true)
+    [[ -n "$ports" ]] && echo "  ports: $ports"
+    t list-panes -t "=$s:0" -F '  #{p12:@devc_name} #{?pane_dead,DEAD (exit #{pane_dead_status}),#{pane_current_command}}'
+  done
+}
+
+cmd_restart() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: devc restart <name>"
+  resolve
+  require_session
+  load_ports
+  local id cmd inst
+  id=$(pane_by_name "$name"); [[ -n "$id" ]] || die "no pane '$name' (see devc status)"
+  cmd=$(t show -p -t "$id" -qv @devc_cmd)
+  inst=$(t show -p -t "$id" -qv @devc_inst)
+  if [[ "$(t display -p -t "$id" '#{pane_dead}')" == 1 ]]; then
+    # the shell itself died — new shell, then re-type env + command
+    t respawn-pane -k -t "$id"
+    is_shell "$cmd" || { t send-keys -t "$id" -l "$(wrap_cmd "$name" "$inst" "$cmd")"; t send-keys -t "$id" Enter; }
+  elif is_shell "$cmd"; then
+    t respawn-pane -k -t "$id"
+  else
+    # live shell: Ctrl-C the process, then re-type the command (env is in the shell)
+    t send-keys -t "$id" C-c
+    sleep 0.4
+    t send-keys -t "$id" -l "$cmd"
+    t send-keys -t "$id" Enter
+  fi
+  echo "devc: restarted $name"
+}
+
+cmd_scale() {
+  local base="${1:-}" target="${2:-}"
+  [[ -n "$base" && "$target" =~ ^[0-9]+$ ]] || die "usage: devc scale <name> <count>"
+  [[ "$base" == ctl ]] && die "won't scale ctl"
+  resolve
+  require_session
+  load_ports
+  local rows=() cur
+  mapfile -t rows < <(t list-panes -t "=$SES:0" -F '#{pane_id};#{@devc_base};#{@devc_inst}' |
+    awk -F';' -v b="$base" '$2==b' | sort -t';' -k3,3n)
+  cur=${#rows[@]}
+  if ((target < cur)); then
+    local i id
+    for ((i = cur - 1; i >= target; i--)); do
+      id="${rows[$i]%%;*}"
+      t kill-pane -t "$id"
+    done
+  elif ((target > cur)); then
+    local cmd='' maxinst=0 n ref dims w h dir
+    if ((cur > 0)); then
+      ref="${rows[$((cur - 1))]%%;*}"
+      cmd=$(t show -p -t "$ref" -qv @devc_cmd)
+      maxinst="${rows[$((cur - 1))]##*;}"
+      [[ "$maxinst" =~ ^[0-9]+$ ]] || maxinst=1
+    else
+      cmd=$(config_cmd_for "$base")
+      [[ -n "$cmd" ]] || die "no pane '$base' running and none in $CONF"
+      ref=$(pane_by_name ctl)
+    fi
+    for ((n = 1; n <= target - cur; n++)); do
+      # split the previous instance, along its longer edge
+      dims=$(t display -p -t "$ref" '#{pane_width} #{pane_height}')
+      w="${dims%% *}"; h="${dims##* }"
+      dir=-v; ((w >= 2 * h)) && dir=-h
+      spawn_pane "$base-$((maxinst + n))" "$base" "$((maxinst + n))" "$cmd" "$ref" "$dir" '50%'
+      ref="$LAST_PANE_ID"
+    done
+  fi
+  echo "devc: $base ×$target"
+}
+
+cmd_add() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: devc add <name> [command]"
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "bad pane name '$name'"
+  [[ "$name" == ctl ]] && die "'ctl' is reserved"
+  shift
+  local at=ctl dir=-v size='50%'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t) at="${2:-}"; shift 2 || die "-t needs a pane name" ;;
+      -h|-v) dir="$1"; shift ;;
+      -l) size="${2:-}"; shift 2 || die "-l needs a size" ;;
+      *) break ;;
+    esac
+  done
+  resolve
+  require_session
+  load_ports
+  [[ -z "$(pane_by_name "$name")" ]] || die "pane '$name' already exists"
+  local target; target=$(pane_by_name "$at")
+  [[ -n "$target" ]] || die "no pane '$at' to split (see devc status)"
+  # 'worker-3' with no command → config's 'worker' command, as instance 3
+  local base="$name" inst=1 cmd="$*"
+  if [[ -z "$cmd" && "$name" =~ ^(.+)-([0-9]+)$ ]]; then
+    base="${BASH_REMATCH[1]}"; inst="${BASH_REMATCH[2]}"
+    cmd=$(config_cmd_for "$base") || true
+    [[ -n "$cmd" ]] || { base="$name"; inst=1; }
+  fi
+  spawn_pane "$name" "$base" "$inst" "${cmd:-zsh}" "$target" "$dir" "$size"
+  echo "devc: added $name"
+}
+
+cmd_logs() {
+  local name='' follow=0 a
+  for a in "$@"; do
+    case "$a" in
+      -f) follow=1 ;;
+      *) name="$a" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: devc logs <name> [-f]"
+  resolve
+  local f="$LOGROOT/$PROJ/$name.log"
+  [[ -f "$f" ]] || die "no log '$f' (have: $(ls "$LOGROOT/$PROJ" 2>/dev/null | tr '\n' ' '))"
+  if ((follow)); then exec tail -n 100 -f "$f"; else exec less -R +G "$f"; fi
+}
+
+# ---------- dispatch ----------
+case "${1:-help}" in
+  init)          shift; cmd_init "$@" ;;
+  start)         shift; cmd_start "$@" ;;
+  attach|a)      shift; cmd_attach "$@" ;;
+  stop)          shift; cmd_stop "$@" ;;
+  status|st|ls)  shift; cmd_status "$@" ;;
+  restart)       shift; cmd_restart "$@" ;;
+  scale)         shift; cmd_scale "$@" ;;
+  add)           shift; cmd_add "$@" ;;
+  logs)          shift; cmd_logs "$@" ;;
+  port)          shift; b="${1:-}"; [[ "$b" =~ ^[0-9]+$ ]] || die "usage: devc port <basePort>"
+                 pick_port "$b" || die "no free port near $b" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command '$1' (try 'devc help')" ;;
+esac
